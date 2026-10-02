@@ -1,318 +1,290 @@
-
 import math
-import numpy as np
 
 
 class Policy:
     def __init__(self, info):
-        self.arena = float(info["arena_size"])
+        self.a = float(info["arena_size"])
+        self.g = int(info["grid_size"])
         self.cell = float(info["cell_size"])
-        self.grid = int(info["grid_size"])
         self.base = tuple(info["base_xy"])
-        self.budget = float(info["energy_budget"])
-        self.alt_min, self.alt_max = map(float, info["altitude_range"])
-        self.vmin, self.vmax = map(float, info["speed_range"])
-        self.max_climb = float(info["max_climb_rate"])
-        self.tan_fov = float(info["footprint_tan"])
-        self.match_r = float(info["match_radius"])
-        self.triage_levels = ("critical", "serious", "minor")
+        self.vmax = float(info["speed_range"][1])
+        self.climb = float(info["max_climb_rate"])
+        self.fov = float(info["footprint_tan"])
+        self.prior = info["prior_map"]
+        self.mean_prior = sum(sum(row) for row in self.prior) / (self.g * self.g) + 1e-12
 
-        self.search_alt = 30.0
-        self.search_speed = self.vmax
-        self.verify_alt = min(14.0, self.alt_max)
-        self.verify_speed = self.vmax
+        self.search_h = 40.0
+        self.verify_h = 12.0
+        radius = self.search_h * self.fov
+        count = max(2, min(
+            16,
+            int(math.ceil((self.a - 2.0 * radius) / (1.55 * radius))) + 1,
+        ))
+        self.lanes = [
+            radius + (self.a - 2.0 * radius) * i / (count - 1)
+            for i in range(count)
+        ]
 
-        self.prior = np.asarray(info["prior_map"], dtype=float)
-        if self.prior.shape != (self.grid, self.grid):
-            self.prior = self.prior.reshape((self.grid, self.grid))
-        self.prior = np.maximum(self.prior, 0.0)
-        self.prior_mean = float(np.mean(self.prior)) + 1e-12
-        self.prior_max = float(np.max(self.prior)) + 1e-12
-
-        # Fixed deterministic coverage lanes.  Spacing is chosen from the
-        # actual sensor footprint, with enough overlap to avoid thin gaps.
-        r = self.search_alt * self.tan_fov
-        n = max(2, int(math.ceil((self.arena - 2.0 * r) / (1.55 * r))) + 1)
-        n = min(n, 16)
-        if n == 1:
-            self.lanes = [self.arena * 0.5]
-        else:
-            self.lanes = [
-                r + (self.arena - 2.0 * r) * i / (n - 1)
-                for i in range(n)
-            ]
-        self.lanes = [min(max(x, 0.0), self.arena) for x in self.lanes]
-
-        # Lane value = prior mass in the strip seen by that lane.
-        centers_x = (np.arange(self.grid) + 0.5) * self.cell
-        lane_value = []
+        values = []
         for x in self.lanes:
-            mask = np.abs(centers_x - x) <= r
-            lane_value.append(float(np.sum(self.prior[mask, :])))
-        self.lane_value = lane_value
+            total = 0.0
+            for ix in range(self.g):
+                if abs((ix + 0.5) * self.cell - x) <= radius:
+                    total += sum(self.prior[ix])
+            values.append(total)
 
-        # Choose a high-value-first order while retaining deterministic routing.
-        # The travel between successive full-height lanes is cheap relative to
-        # the 400 m sweep itself, so prior mass is the dominant criterion.
-        remaining = set(range(len(self.lanes)))
-        order = []
-        px = 0.0
+        remaining = set(range(count))
+        self.order = []
+        lastx = 0.0
         while remaining:
-            best = None
-            best_score = -1.0
-            for j in remaining:
-                dx = abs(self.lanes[j] - px)
-                score = self.lane_value[j] / (380.0 + dx)
-                if score > best_score:
-                    best_score = score
-                    best = j
-            order.append(best)
-            px = self.lanes[best]
-            remaining.remove(best)
-        self.lane_order = order
+            j = max(
+                remaining,
+                key=lambda k: values[k] / (380.0 + abs(self.lanes[k] - lastx)),
+            )
+            self.order.append(j)
+            remaining.remove(j)
+            lastx = self.lanes[j]
+
         self.lane_i = 0
-        self.go_up = True
-
+        self.up = True
         self.clusters = []
-        self.declared = []
-        self.verify_queue = []
-        self.current_verify = None
-        self.verify_stage = 0
+        self.queue = []
+        self.done_xy = []
+        self.current = None
+        self.stage = 0
         self.returning = False
-
         self.last_t = None
-        self.power_est = 1.25
-        self.max_power_est = 1.6
-        self.search_done = False
-        self._seen_action = 0
+        self.max_power = 1.7
 
-    def _dist(self, x, y, x2=0.0, y2=0.0):
-        return math.hypot(x - x2, y - y2)
+    def _prior(self, x, y):
+        ix, iy = int(x / self.cell), int(y / self.cell)
+        if 0 <= ix < self.g and 0 <= iy < self.g:
+            return float(self.prior[ix][iy])
+        return 0.0
 
-    def _cell_prior(self, x, y):
-        ix = int(x / self.cell)
-        iy = int(y / self.cell)
-        if ix < 0 or iy < 0 or ix >= self.grid or iy >= self.grid:
-            return 0.0
-        return float(self.prior[ix, iy])
+    def _near_done(self, x, y):
+        return any(
+            math.hypot(x - dx, y - dy) < 10.0
+            for dx, dy in self.done_xy
+        )
 
-    def _candidate_score(self, c):
-        # Multiple independent-looking detections are much stronger than one.
-        # Prior contributes, but is deliberately capped so the prior cannot
-        # suppress genuine low-prior survivors.
-        p = self._cell_prior(c["x"], c["y"]) / self.prior_mean
-        p = min(3.0, max(0.0, p))
-        hits = c["hits"]
-        tri = 1.0 if c["triage_hits"] else 0.0
-        return 2.0 * min(hits, 4) + 0.55 * p + 1.5 * tri
+    def _cluster(self, x, y):
+        found, best = None, 8.0
+        for c in self.clusters:
+            if not c["resolved"]:
+                d = math.hypot(x - c["x"], y - c["y"])
+                if d < best:
+                    found, best = c, d
+        return found
 
-    def _find_cluster(self, x, y):
-        best = None
-        bd = 6.0
-        for i, c in enumerate(self.clusters):
-            if c["resolved"]:
-                continue
-            d = math.hypot(x - c["x"], y - c["y"])
-            if d < bd:
-                bd = d
-                best = i
-        return best
+    def _ingest(self, obs):
+        low = float(obs["altitude"]) <= self.verify_h + 1.0
 
-    def _add_detections(self, detections):
-        for d in detections:
+        for d in obs.get("detections", []):
             x = float(d["x"])
             y = float(d["y"])
             tri = d.get("triage")
-            k = self._find_cluster(x, y)
-            if k is None:
-                self.clusters.append({
-                    "x": x, "y": y, "hits": 1,
-                    "triage_hits": [tri] if tri in self.triage_levels else [],
-                    "last_t": float(d.get("t", 0.0)),
+
+            if self._near_done(x, y):
+                continue
+
+            c = self._cluster(x, y)
+            if c is None:
+                c = {
+                    "x": x,
+                    "y": y,
+                    "n": 1,
+                    "tri": [],
+                    "low": [],
                     "resolved": False,
                     "queued": False,
-                })
+                }
+                self.clusters.append(c)
             else:
-                c = self.clusters[k]
-                # Running mean reduces the already-small sensor position noise.
-                n = c["hits"]
-                c["x"] = (c["x"] * n + x) / (n + 1.0)
-                c["y"] = (c["y"] * n + y) / (n + 1.0)
-                c["hits"] = n + 1
-                c["last_t"] = float(d.get("t", c["last_t"]))
-                if tri in self.triage_levels:
-                    c["triage_hits"].append(tri)
+                n = c["n"]
+                c["x"] = (c["x"] * n + x) / (n + 1)
+                c["y"] = (c["y"] * n + y) / (n + 1)
+                c["n"] = n + 1
 
-        # Queue strong candidates once.  A singleton is accepted only when
-        # the prior is unusually high; otherwise require repeated detection.
+            if tri in ("critical", "serious", "minor"):
+                c["tri"].append(tri)
+                if low:
+                    c["low"].append((x, y, tri))
+
         for c in self.clusters:
             if c["resolved"] or c["queued"]:
                 continue
-            p = self._cell_prior(c["x"], c["y"]) / self.prior_mean
-            strong = c["hits"] >= 2
-            very_high_prior = p >= 2.0 and c["hits"] >= 1
-            if strong or very_high_prior or c["triage_hits"]:
+            high_prior_single = (
+                c["n"] == 1
+                and self._prior(c["x"], c["y"]) >= 2.2 * self.mean_prior
+            )
+            if c["n"] >= 2 or c["tri"] or high_prior_single:
                 c["queued"] = True
-                self.verify_queue.append(c)
+                self.queue.append(c)
 
-    def _triage_choice(self, hits):
-        if not hits:
+    def _return_cost(self, obs):
+        d = math.hypot(
+            float(obs["x"]) - self.base[0],
+            float(obs["y"]) - self.base[1],
+        )
+        duration = max(
+            d / self.vmax,
+            abs(float(obs["altitude"]) - self.search_h) / self.climb,
+            0.5,
+        )
+        return duration * self.max_power * 1.18
+
+    def _safe(self, obs, c):
+        d = math.hypot(
+            c["x"] - float(obs["x"]),
+            c["y"] - float(obs["y"]),
+        )
+        go = max(
+            d / self.vmax,
+            abs(float(obs["altitude"]) - self.verify_h) / self.climb,
+            0.5,
+        )
+        return (
+            float(obs["energy_remaining"])
+            > self._return_cost(obs) + go * 1.8 + 48.0
+        )
+
+    def _pick(self, obs):
+        x = float(obs["x"])
+        y = float(obs["y"])
+        candidates = [c for c in self.queue if not c["resolved"]]
+        if not candidates:
             return None
-        counts = {"critical": 0, "serious": 0, "minor": 0}
-        for x in hits:
-            if x in counts:
-                counts[x] += 1
-        return max(counts, key=counts.get)
 
-    def _estimate_return_cost(self, obs):
-        d = self._dist(obs["x"], obs["y"], self.base[0], self.base[1])
-        duration = max(d / self.vmax,
-                       abs(float(obs["altitude"]) - self.search_alt) / self.max_climb,
-                       0.5)
-        return duration * max(1.65, self.max_power_est * 1.15)
+        def score(c):
+            confidence = min(c["n"], 4) * 2.0
+            confidence += 1.5 if c["tri"] else 0.0
+            confidence += min(
+                3.0,
+                self._prior(c["x"], c["y"]) / self.mean_prior,
+            ) * 0.45
+            distance = math.hypot(c["x"] - x, c["y"] - y)
+            return confidence / (1.0 + distance / 120.0)
 
-    def _safe_to_start(self, obs, target_x, target_y, target_alt):
-        d = math.hypot(target_x - obs["x"], target_y - obs["y"])
-        dur = max(d / self.vmax,
-                  abs(target_alt - obs["altitude"]) / self.max_climb,
-                  0.5)
-        # Verification may need one hover and one declaration.
-        projected = dur * 1.65 + 1.65 + 1.65
-        return float(obs["energy_remaining"]) > self._estimate_return_cost(obs) + projected + 45.0
+        return max(candidates, key=score)
 
-    def _choose_verification(self, obs):
-        if not self.verify_queue:
-            return None
-        x, y = obs["x"], obs["y"]
-        best = None
-        best_score = -1e30
-        for c in self.verify_queue:
-            if c["resolved"]:
-                continue
-            d = math.hypot(c["x"] - x, c["y"] - y)
-            # Prefer high-confidence candidates, but discount very expensive detours.
-            s = self._candidate_score(c) / (1.0 + d / 120.0)
-            if s > best_score:
-                best_score = s
-                best = c
-        return best
-
-    def _remove_from_queue(self, c):
-        self.verify_queue = [q for q in self.verify_queue if q is not c]
-
-    def _process_new_triage(self, c):
-        if not c["triage_hits"]:
-            return None
-        return self._triage_choice(c["triage_hits"])
-
-    def _mark_declared(self, c):
+    def _resolve(self, c):
         c["resolved"] = True
-        self.declared.append((c["x"], c["y"]))
-        self._remove_from_queue(c)
-        self.current_verify = None
-        self.verify_stage = 0
+        self.current = None
+        self.stage = 0
 
     def act(self, obs):
-        self._seen_action += 1
-
-        # Online energy-rate estimate.  Keep a conservative upper envelope for
-        # return decisions because wind can change.
         t = float(obs["t"])
-        if self.last_t is not None:
-            dt = t - self.last_t
-            if dt > 1e-6:
-                p = float(obs.get("energy_used_last_action", 0.0)) / dt
-                if p > 0.0 and math.isfinite(p):
-                    self.power_est = 0.8 * self.power_est + 0.2 * p
-                    self.max_power_est = max(self.max_power_est * 0.995, p)
+
+        if self.last_t is not None and t > self.last_t:
+            power = float(obs.get("energy_used_last_action", 0.0)) / (t - self.last_t)
+            if power > 0.0 and math.isfinite(power):
+                self.max_power = max(self.max_power * 0.996, power)
+
         self.last_t = t
+        self._ingest(obs)
 
-        self._add_detections(obs.get("detections", []))
-
-        # Never sacrifice the return.  The reserve is intentionally generous.
-        ret = self._estimate_return_cost(obs)
-        if (not self.returning and
-                float(obs["energy_remaining"]) < ret + 55.0):
+        if (
+            not self.returning
+            and float(obs["energy_remaining"]) < self._return_cost(obs) + 52.0
+        ):
             self.returning = True
 
         if self.returning:
-            if self._dist(obs["x"], obs["y"], self.base[0], self.base[1]) <= 12.0:
+            home_dist = math.hypot(
+                float(obs["x"]) - self.base[0],
+                float(obs["y"]) - self.base[1],
+            )
+            if home_dist <= 12.0:
                 return {"type": "land"}
+
             return {
                 "type": "fly_to",
-                "x": self.base[0], "y": self.base[1],
-                "altitude": self.search_alt, "speed": self.vmax
+                "x": self.base[0],
+                "y": self.base[1],
+                "altitude": self.search_h,
+                "speed": self.vmax,
             }
 
-        # If a candidate is already at low altitude and has triage, declare it
-        # immediately; declaration time matters for the exponential decay.
-        if self.current_verify is not None:
-            c = self.current_verify
-            tri = self._process_new_triage(c)
-            if tri is not None:
-                self._mark_declared(c)
-                return {"type": "declare", "x": c["x"], "y": c["y"], "triage": tri}
+        if self.current is not None:
+            c = self.current
 
-            if self.verify_stage == 1:
-                # One short low-altitude hover gives another pair of detection
-                # opportunities before we fall back to a conservative serious label.
-                self.verify_stage = 2
-                return {"type": "hover", "duration": 1.0}
+            if c["low"]:
+                votes = {"critical": 0, "serious": 0, "minor": 0}
+                for _, _, tri in c["low"]:
+                    votes[tri] += 1
 
-            # A repeated high-altitude candidate with no low-altitude triage is
-            # still much more likely real than a random false positive.
-            if c["hits"] >= 2:
-                self._mark_declared(c)
-                return {"type": "declare", "x": c["x"], "y": c["y"], "triage": "serious"}
+                tri = max(votes, key=votes.get)
+                points = [
+                    (x, y)
+                    for x, y, label in c["low"]
+                    if label == tri
+                ]
+                x = sum(point[0] for point in points) / len(points)
+                y = sum(point[1] for point in points) / len(points)
 
-            c["resolved"] = True
-            self._remove_from_queue(c)
-            self.current_verify = None
-            self.verify_stage = 0
-
-        # During the sweep, verify a nearby strong candidate so the detour does
-        # not destroy the route.  Otherwise keep covering new prior mass.
-        candidate = self._choose_verification(obs)
-        if candidate is not None:
-            d = math.hypot(candidate["x"] - obs["x"], candidate["y"] - obs["y"])
-            if d <= 110.0 and self._safe_to_start(obs, candidate["x"], candidate["y"], self.verify_alt):
-                self.current_verify = candidate
-                self.verify_stage = 1
+                self.done_xy.append((x, y))
+                self._resolve(c)
                 return {
-                    "type": "fly_to",
-                    "x": candidate["x"], "y": candidate["y"],
-                    "altitude": self.verify_alt, "speed": self.verify_speed
+                    "type": "declare",
+                    "x": x,
+                    "y": y,
+                    "triage": tri,
                 }
 
-        # Once all coverage lanes are done, spend remaining safe budget on
-        # strongest candidates, then return.
-        if self.lane_i >= len(self.lane_order):
-            self.search_done = True
-            candidate = self._choose_verification(obs)
-            if candidate is not None and self._safe_to_start(
-                    obs, candidate["x"], candidate["y"], self.verify_alt):
-                self.current_verify = candidate
-                self.verify_stage = 1
+            if self.stage < 2:
+                self.stage += 1
+                return {"type": "hover", "duration": 1.5}
+
+            self._resolve(c)
+
+        c = self._pick(obs)
+        if c is not None:
+            d = math.hypot(
+                c["x"] - float(obs["x"]),
+                c["y"] - float(obs["y"]),
+            )
+            if d <= 115.0 and self._safe(obs, c):
+                self.current = c
+                self.stage = 0
                 return {
                     "type": "fly_to",
-                    "x": candidate["x"], "y": candidate["y"],
-                    "altitude": self.verify_alt, "speed": self.verify_speed
+                    "x": c["x"],
+                    "y": c["y"],
+                    "altitude": self.verify_h,
+                    "speed": self.vmax,
                 }
+
+        if self.lane_i >= len(self.order):
+            if c is not None and self._safe(obs, c):
+                self.current = c
+                self.stage = 0
+                return {
+                    "type": "fly_to",
+                    "x": c["x"],
+                    "y": c["y"],
+                    "altitude": self.verify_h,
+                    "speed": self.vmax,
+                }
+
             self.returning = True
             return {
                 "type": "fly_to",
-                "x": self.base[0], "y": self.base[1],
-                "altitude": self.search_alt, "speed": self.vmax
+                "x": self.base[0],
+                "y": self.base[1],
+                "altitude": self.search_h,
+                "speed": self.vmax,
             }
 
-        # Full-height search lane.  Alternating endpoints minimizes the
-        # inter-lane transit while maintaining deterministic coverage.
-        lane = self.lane_order[self.lane_i]
+        lane = self.order[self.lane_i]
         self.lane_i += 1
-        y = self.arena if self.go_up else 0.0
-        self.go_up = not self.go_up
+        y = self.a if self.up else 0.0
+        self.up = not self.up
+
         return {
             "type": "fly_to",
-            "x": self.lanes[lane], "y": y,
-            "altitude": self.search_alt, "speed": self.search_speed
+            "x": self.lanes[lane],
+            "y": y,
+            "altitude": self.search_h,
+            "speed": self.vmax,
         }
