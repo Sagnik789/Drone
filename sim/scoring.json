@@ -1,0 +1,17 @@
+{
+  "triage_weights": {"critical": 3.0, "serious": 2.0, "minor": 1.0},
+  "triage_decay_tau": {"critical": 300.0, "serious": 600.0, "minor": 1200.0},
+  "wrong_triage_factor": 0.5,
+  "match_radius": 5.0,
+  "lambda_fp": 1.0,
+  "return_penalty": 0.3,
+  "episode_score_floor": -1.0,
+  "limits": {
+    "act_time_limit_s": 0.2,
+    "episode_decision_time_limit_s": 30.0,
+    "init_time_limit_s": 10.0,
+    "ipc_grace_s": 0.02,
+    "max_actions": 1500,
+    "max_invalid_actions": 50
+  }
+}
