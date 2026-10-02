@@ -99,7 +99,7 @@ for seed in SEEDS:
                 ep = run_episode(seed)
 
                 ep.step({
-                    "action": "fly_to",
+                    "type": "fly_to",
                     "x": distance_m,
                     "y": 0,
                     "altitude": altitude,
@@ -144,7 +144,7 @@ for seed in SEEDS:
         ep = run_episode(seed)
 
         ep.step({
-            "action": "fly_to",
+            "type": "fly_to",
             "x": x,
             "y": y,
             "altitude": 40,
@@ -202,7 +202,7 @@ for seed in SEEDS:
                 ep = run_episode(seed)
 
                 ep.step({
-                    "action": "fly_to",
+                    "type": "fly_to",
                     "x": sx,
                     "y": sy,
                     "altitude": altitude,
@@ -210,7 +210,7 @@ for seed in SEEDS:
                 })
 
                 ep.step({
-                    "action": "hover",
+                    "type": "hover",
                     "duration": duration,
                 })
 
@@ -265,7 +265,7 @@ for seed in SEEDS:
             ep = run_episode(seed)
 
             ep.step({
-                "action": "fly_to",
+                "type": "fly_to",
                 "x": sx,
                 "y": sy,
                 "altitude": altitude,
@@ -273,7 +273,7 @@ for seed in SEEDS:
             })
 
             ep.step({
-                "action": "hover",
+                "type": "hover",
                 "duration": 20,
             })
 
@@ -333,7 +333,7 @@ for seed in SEEDS:
             ep = run_episode(seed)
 
             ep.step({
-                "action": "fly_to",
+                "type": "fly_to",
                 "x": x,
                 "y": y,
                 "altitude": altitude,
@@ -341,7 +341,7 @@ for seed in SEEDS:
             })
 
             ep.step({
-                "action": "hover",
+                "type": "hover",
                 "duration": 20,
             })
 
@@ -398,7 +398,7 @@ for seed in SEEDS:
             ep = run_episode(seed)
 
             ep.step({
-                "action": "fly_to",
+                "type": "fly_to",
                 "x": sx,
                 "y": sy,
                 "altitude": altitude,
@@ -406,7 +406,7 @@ for seed in SEEDS:
             })
 
             ep.step({
-                "action": "hover",
+                "type": "hover",
                 "duration": 10,
             })
 
